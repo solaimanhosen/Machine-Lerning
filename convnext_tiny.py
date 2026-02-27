@@ -4,8 +4,8 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from datasets import load_dataset
 import timm
-from tqdm import tqdm
 import gc
+import csv
 
 # ==========================================
 # 0. Clean up previous memory
@@ -143,6 +143,9 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 # 5. Training Loop
 # ==========================================
 best_val_acc = 0.0
+sample_rate_q = VIRTUAL_BATCH_SIZE / len(trainset)
+steps_T = int(EPOCHS / sample_rate_q)
+sigma = float(getattr(optimizer, "noise_multiplier", 0.0)) if USE_DIFFERENTIAL_PRIVACY else 0.0
 
 for epoch in range(EPOCHS):
     model.train()
@@ -151,8 +154,7 @@ for epoch in range(EPOCHS):
 
     def run_train_epoch(data_loader):
         """Inner training loop, shared by both DP and non-DP paths."""
-        progress_bar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]")
-        for images, targets in progress_bar:
+        for images, targets in data_loader:
             images, targets = images.to(DEVICE), targets.to(DEVICE)
 
             optimizer.zero_grad()
@@ -165,8 +167,6 @@ for epoch in range(EPOCHS):
             _, predicted = outputs.max(1)
             train_stats['total']   += targets.size(0)
             train_stats['correct'] += predicted.eq(targets).sum().item()
-
-            progress_bar.set_postfix({'Loss': f'{loss.item():.4f}'})
 
     if USE_DIFFERENTIAL_PRIVACY:
         with BatchMemoryManager(
@@ -190,7 +190,7 @@ for epoch in range(EPOCHS):
     test_total   = 0
 
     with torch.no_grad():
-        for images, targets in tqdm(testloader, desc=f"Epoch {epoch+1}/{EPOCHS} [Val]"):
+        for images, targets in testloader:
             images, targets = images.to(DEVICE), targets.to(DEVICE)
 
             outputs = model(images)
@@ -222,3 +222,22 @@ for epoch in range(EPOCHS):
     print("-" * 60)
 
 print(f"\nTraining complete. Best Val Acc: {best_val_acc:.2f}%")
+
+results_csv = "convnext_tiny_results.csv"
+csv_fields = ["Epochs", "batch size", "sample rate (q)", "steps (T)", "best_val_acc", "sigma"]
+csv_row = {
+    "Epochs": EPOCHS,
+    "batch size": VIRTUAL_BATCH_SIZE,
+    "sample rate (q)": sample_rate_q,
+    "steps (T)": steps_T,
+    "best_val_acc": best_val_acc,
+    "sigma": sigma,
+}
+
+with open(results_csv, "a", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=csv_fields)
+    if f.tell() == 0:
+        writer.writeheader()
+    writer.writerow(csv_row)
+
+print(f"Saved training summary to {results_csv}")
