@@ -21,6 +21,6 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "Working directory: $(pwd)"
 
 # RUN PROGRAM
-python convnext_tiny.py > logs/convnext_tiny_run_nonprivate.log 2>&1
+python convnext_tiny.py --no-use-differential-privacy --target-epsilon 8.0 > logs/convnext_tiny_run_nonprivate.log 2>&1
 
 echo "Job completed successfully"

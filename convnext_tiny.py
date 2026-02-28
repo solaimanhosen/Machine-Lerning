@@ -6,6 +6,8 @@ from datasets import load_dataset
 import timm
 import gc
 import csv
+import os
+import argparse
 
 # ==========================================
 # 0. Clean up previous memory
@@ -18,21 +20,50 @@ if torch.cuda.is_available():
 # 1. Hyperparameters & DP Configuration
 # ==========================================
 
-# 🔒 Toggle Differential Privacy on/off
-USE_DIFFERENTIAL_PRIVACY = True
+DEFAULT_USE_DIFFERENTIAL_PRIVACY = True
+DEFAULT_TARGET_EPSILON = 10.0
+DEFAULT_LEARNING_RATE = 2e-4
 
-TARGET_EPSILON = 8.0
+parser = argparse.ArgumentParser(description="Train ConvNeXt on Tiny ImageNet with optional Differential Privacy.")
+parser.add_argument(
+    "--target-epsilon",
+    type=float,
+    default=DEFAULT_TARGET_EPSILON,
+    help="Target privacy epsilon used when differential privacy is enabled.",
+)
+parser.add_argument(
+    "--use-differential-privacy",
+    action=argparse.BooleanOptionalAction,
+    default=DEFAULT_USE_DIFFERENTIAL_PRIVACY,
+    help="Enable/disable differential privacy (use --no-use-differential-privacy to disable).",
+)
+parser.add_argument(
+    "--learning-rate",
+    type=float,
+    default=DEFAULT_LEARNING_RATE,
+    help="Initial learning rate for Adam optimizer.",
+)
+args = parser.parse_args()
+
+USE_DIFFERENTIAL_PRIVACY = args.use_differential_privacy
+TARGET_EPSILON = args.target_epsilon
+LEARNING_RATE = args.learning_rate
 TARGET_DELTA   = 1e-5
 MAX_GRAD_NORM  = 1.0
 EPOCHS         = 30
 
-LEARNING_RATE           = 1e-3
 VIRTUAL_BATCH_SIZE      = 8000 if USE_DIFFERENTIAL_PRIVACY else 256
 MAX_PHYSICAL_BATCH_SIZE = 32
+epsilon_str             = str(TARGET_EPSILON).replace(".", "p")
+learning_rate_str       = str(LEARNING_RATE).replace(".", "p")
+OUTPUT_DIR              = os.path.join("outputs", f"epsilon={epsilon_str}_lr={learning_rate_str}")
+BEST_MODEL_PATH         = os.path.join(OUTPUT_DIR, "best_model.pth")
+RESULTS_CSV_PATH        = os.path.join(OUTPUT_DIR, "convnext_tiny_results.csv")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 torch.backends.cudnn.benchmark = True
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ==========================================
 # 2. Data Loading & Transforms
@@ -135,6 +166,7 @@ if USE_DIFFERENTIAL_PRIVACY:
     print(f"Using noise multiplier: {optimizer.noise_multiplier:.4f}")
 else:
     print("⚠️  Differential Privacy DISABLED — training without privacy guarantees.")
+print(f"Output directory: {OUTPUT_DIR}")
 
 # Cosine annealing LR scheduler — attach AFTER make_private_with_epsilon
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
@@ -205,7 +237,7 @@ for epoch in range(EPOCHS):
 
     if test_acc > best_val_acc:
         best_val_acc = test_acc
-        torch.save(model.state_dict(), "best_model.pth")
+        torch.save(model.state_dict(), BEST_MODEL_PATH)
         print(f"  ✅ New best model saved ({best_val_acc:.2f}%)")
 
     current_lr = scheduler.get_last_lr()[0]
@@ -223,7 +255,6 @@ for epoch in range(EPOCHS):
 
 print(f"\nTraining complete. Best Val Acc: {best_val_acc:.2f}%")
 
-results_csv = "convnext_tiny_results.csv"
 csv_fields = ["Epochs", "batch size", "sample rate (q)", "steps (T)", "best_val_acc", "sigma"]
 csv_row = {
     "Epochs": EPOCHS,
@@ -234,10 +265,10 @@ csv_row = {
     "sigma": sigma,
 }
 
-with open(results_csv, "a", newline="") as f:
+with open(RESULTS_CSV_PATH, "a", newline="") as f:
     writer = csv.DictWriter(f, fieldnames=csv_fields)
     if f.tell() == 0:
         writer.writeheader()
     writer.writerow(csv_row)
 
-print(f"Saved training summary to {results_csv}")
+print(f"Saved training summary to {RESULTS_CSV_PATH}")
