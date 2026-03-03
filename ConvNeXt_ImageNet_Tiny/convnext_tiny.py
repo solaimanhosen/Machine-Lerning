@@ -10,265 +10,317 @@ import os
 import argparse
 
 # ==========================================
-# 0. Clean up previous memory
-# ==========================================
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-    gc.collect()
-
-# ==========================================
 # 1. Hyperparameters & DP Configuration
 # ==========================================
 
 DEFAULT_USE_DIFFERENTIAL_PRIVACY = True
-DEFAULT_TARGET_EPSILON = 10.0
 DEFAULT_LEARNING_RATE = 2e-4
 
-parser = argparse.ArgumentParser(description="Train ConvNeXt on Tiny ImageNet with optional Differential Privacy.")
-parser.add_argument(
-    "--target-epsilon",
-    type=float,
-    default=DEFAULT_TARGET_EPSILON,
-    help="Target privacy epsilon used when differential privacy is enabled.",
-)
-parser.add_argument(
-    "--use-differential-privacy",
-    action=argparse.BooleanOptionalAction,
-    default=DEFAULT_USE_DIFFERENTIAL_PRIVACY,
-    help="Enable/disable differential privacy (use --no-use-differential-privacy to disable).",
-)
-parser.add_argument(
-    "--learning-rate",
-    type=float,
-    default=DEFAULT_LEARNING_RATE,
-    help="Initial learning rate for Adam optimizer.",
-)
-args = parser.parse_args()
+def start_training(args):
+    # ==========================================
+    # 0. Clean up previous memory
+    # ==========================================
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
 
-USE_DIFFERENTIAL_PRIVACY = args.use_differential_privacy
-TARGET_EPSILON = args.target_epsilon
-LEARNING_RATE = args.learning_rate
-TARGET_DELTA   = 1e-5
-MAX_GRAD_NORM  = 1.0
-EPOCHS         = 30
+    USE_DIFFERENTIAL_PRIVACY = args.use_differential_privacy
+    TARGET_EPSILON = args.target_epsilon
+    TARGET_SIGMA = args.sigma
+    LEARNING_RATE = args.learning_rate
+    TARGET_DELTA   = 1e-5
+    MAX_GRAD_NORM  = 1.0
+    EPOCHS         = 30
 
-VIRTUAL_BATCH_SIZE      = 8000 if USE_DIFFERENTIAL_PRIVACY else 256
-MAX_PHYSICAL_BATCH_SIZE = 32
-epsilon_str             = str(TARGET_EPSILON).replace(".", "p")
-learning_rate_str       = str(LEARNING_RATE).replace(".", "p")
-OUTPUT_DIR              = os.path.join("outputs", f"epsilon={epsilon_str}_lr={learning_rate_str}")
-BEST_MODEL_PATH         = os.path.join(OUTPUT_DIR, "best_model.pth")
-RESULTS_CSV_PATH        = os.path.join(OUTPUT_DIR, "convnext_tiny_results.csv")
+    # if USE_DIFFERENTIAL_PRIVACY and TARGET_EPSILON is None and TARGET_SIGMA is None:
+    #     parser.error("When differential privacy is enabled, provide either --epsilon/--target-epsilon or --sigma.")
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    VIRTUAL_BATCH_SIZE      = 8000 if USE_DIFFERENTIAL_PRIVACY else 256
+    MAX_PHYSICAL_BATCH_SIZE = 32
+    learning_rate_str       = str(LEARNING_RATE).replace(".", "p")
+    if USE_DIFFERENTIAL_PRIVACY:
+        if TARGET_SIGMA is not None:
+            privacy_config_str = f"sigma={str(TARGET_SIGMA).replace('.', 'p')}"
+        else:
+            privacy_config_str = f"epsilon={str(TARGET_EPSILON).replace('.', 'p')}"
+    else:
+        privacy_config_str = "no_dp"
+    OUTPUT_DIR              = os.path.join("outputs", f"{privacy_config_str}_lr={learning_rate_str}")
+    BEST_MODEL_PATH         = os.path.join(OUTPUT_DIR, "best_model.pth")
+    RESULTS_CSV_PATH        = os.path.join(OUTPUT_DIR, "convnext_tiny_results.csv")
 
-torch.backends.cudnn.benchmark = True
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ==========================================
-# 2. Data Loading & Transforms
-# ==========================================
-class HFDatasetWrapper(Dataset):
-    """Wraps Hugging Face datasets into PyTorch Datasets with image transforms."""
-    def __init__(self, hf_dataset, transform=None):
-        self.hf_dataset = hf_dataset
-        self.transform = transform
+    torch.backends.cudnn.benchmark = True
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    def __len__(self):
-        return len(self.hf_dataset)
+    # ==========================================
+    # 2. Data Loading & Transforms
+    # ==========================================
+    class HFDatasetWrapper(Dataset):
+        """Wraps Hugging Face datasets into PyTorch Datasets with image transforms."""
+        def __init__(self, hf_dataset, transform=None):
+            self.hf_dataset = hf_dataset
+            self.transform = transform
 
-    def __getitem__(self, idx):
-        item = self.hf_dataset[idx]
-        image = item['image'].convert('RGB')
-        label = item['label']
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+        def __len__(self):
+            return len(self.hf_dataset)
 
-print("Loading Tiny ImageNet...")
-hf_train = load_dataset("zh-plus/tiny-imagenet", split="train")
-hf_test  = load_dataset("zh-plus/tiny-imagenet", split="valid")
+        def __getitem__(self, idx):
+            item = self.hf_dataset[idx]
+            image = item['image'].convert('RGB')
+            label = item['label']
+            if self.transform:
+                image = self.transform(image)
+            return image, label
 
-normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
+    print("Loading Tiny ImageNet...")
+    hf_train = load_dataset("zh-plus/tiny-imagenet", split="train")
+    hf_test  = load_dataset("zh-plus/tiny-imagenet", split="valid")
 
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomCrop(224, padding=16),
-    transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
-    transforms.ToTensor(),
-    normalize,
-])
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                    std=[0.229, 0.224, 0.225])
 
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
-    transforms.ToTensor(),
-    normalize,
-])
+    train_transform = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(224, padding=16),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3),
+        transforms.ToTensor(),
+        normalize,
+    ])
 
-trainset = HFDatasetWrapper(hf_train, transform=train_transform)
-testset  = HFDatasetWrapper(hf_test,  transform=test_transform)
+    test_transform = transforms.Compose([
+        transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        normalize,
+    ])
 
-trainloader = DataLoader(
-    trainset,
-    batch_size=VIRTUAL_BATCH_SIZE,
-    shuffle=True,
-    num_workers=4,
-    pin_memory=True,
-    persistent_workers=True,
-)
-testloader = DataLoader(
-    testset,
-    batch_size=MAX_PHYSICAL_BATCH_SIZE,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True,
-    persistent_workers=True,
-)
+    trainset = HFDatasetWrapper(hf_train, transform=train_transform)
+    testset  = HFDatasetWrapper(hf_test,  transform=test_transform)
 
-# ==========================================
-# 3. Model & Optimizer Initialization
-# ==========================================
-print("Initializing ConvNeXt-Small...")
-model = timm.create_model('convnext_small', pretrained=True, num_classes=200)
-model = model.to(DEVICE)
-
-# Weight decay must be 0 for Differential Privacy; fine for non-DP too
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=LEARNING_RATE,
-    weight_decay=0.0 if USE_DIFFERENTIAL_PRIVACY else 1e-4,
-)
-criterion = nn.CrossEntropyLoss()
-
-# ==========================================
-# 4. Optionally Attach the Privacy Engine
-# ==========================================
-privacy_engine = None
-
-if USE_DIFFERENTIAL_PRIVACY:
-    from opacus import PrivacyEngine
-    from opacus.utils.batch_memory_manager import BatchMemoryManager
-
-    print("Configuring Opacus Privacy Engine...")
-    privacy_engine = PrivacyEngine()
-
-    model, optimizer, trainloader = privacy_engine.make_private_with_epsilon(
-        module=model,
-        optimizer=optimizer,
-        data_loader=trainloader,
-        epochs=EPOCHS,
-        target_epsilon=TARGET_EPSILON,
-        target_delta=TARGET_DELTA,
-        max_grad_norm=MAX_GRAD_NORM,
+    trainloader = DataLoader(
+        trainset,
+        batch_size=VIRTUAL_BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
-    print(f"Using noise multiplier: {optimizer.noise_multiplier:.4f}")
-else:
-    print("⚠️  Differential Privacy DISABLED — training without privacy guarantees.")
-print(f"Output directory: {OUTPUT_DIR}")
-
-# Cosine annealing LR scheduler — attach AFTER make_private_with_epsilon
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-# ==========================================
-# 5. Training Loop
-# ==========================================
-best_val_acc = 0.0
-sample_rate_q = VIRTUAL_BATCH_SIZE / len(trainset)
-steps_T = int(EPOCHS / sample_rate_q)
-sigma = float(getattr(optimizer, "noise_multiplier", 0.0)) if USE_DIFFERENTIAL_PRIVACY else 0.0
-
-for epoch in range(EPOCHS):
-    model.train()
-    # Using a dictionary to hold mutable state across the inner function scope
-    train_stats = {'loss': 0.0, 'correct': 0, 'total': 0}
-
-    def run_train_epoch(data_loader):
-        """Inner training loop, shared by both DP and non-DP paths."""
-        for images, targets in data_loader:
-            images, targets = images.to(DEVICE), targets.to(DEVICE)
-
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss    = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-
-            train_stats['loss'] += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            train_stats['total']   += targets.size(0)
-            train_stats['correct'] += predicted.eq(targets).sum().item()
-
-    if USE_DIFFERENTIAL_PRIVACY:
-        with BatchMemoryManager(
-            data_loader=trainloader,
-            max_physical_batch_size=MAX_PHYSICAL_BATCH_SIZE,
-            optimizer=optimizer,
-        ) as memory_safe_data_loader:
-            run_train_epoch(memory_safe_data_loader)
-    else:
-        run_train_epoch(trainloader)
-
-    train_acc = 100. * train_stats['correct'] / train_stats['total']
-    scheduler.step()
+    testloader = DataLoader(
+        testset,
+        batch_size=MAX_PHYSICAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+    )
 
     # ==========================================
-    # Validation Loop
+    # 3. Model & Optimizer Initialization
     # ==========================================
-    model.eval()
-    test_loss    = 0.0
-    test_correct = 0
-    test_total   = 0
+    print("Initializing ConvNeXt-Small...")
+    model = timm.create_model('convnext_small', pretrained=True, num_classes=200)
+    model = model.to(DEVICE)
 
-    with torch.no_grad():
-        for images, targets in testloader:
-            images, targets = images.to(DEVICE), targets.to(DEVICE)
+    # Weight decay must be 0 for Differential Privacy; fine for non-DP too
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=0.0 if USE_DIFFERENTIAL_PRIVACY else 1e-4,
+    )
+    criterion = nn.CrossEntropyLoss()
 
-            outputs = model(images)
-            loss    = criterion(outputs, targets)
+    # ==========================================
+    # 4. Optionally Attach the Privacy Engine
+    # ==========================================
+    privacy_engine = None
 
-            test_loss    += loss.item() * images.size(0)
-            _, predicted  = outputs.max(1)
-            test_total   += targets.size(0)
-            test_correct += predicted.eq(targets).sum().item()
-
-    test_acc = 100. * test_correct / test_total
-
-    if test_acc > best_val_acc:
-        best_val_acc = test_acc
-        torch.save(model.state_dict(), BEST_MODEL_PATH)
-        print(f"  ✅ New best model saved ({best_val_acc:.2f}%)")
-
-    current_lr = scheduler.get_last_lr()[0]
-
-    print(f"\nEnd of Epoch {epoch+1}:")
-    print(f"  Train Acc : {train_acc:.2f}%")
-    print(f"  Val Acc   : {test_acc:.2f}%  (Best: {best_val_acc:.2f}%)")
     if USE_DIFFERENTIAL_PRIVACY:
-        epsilon = privacy_engine.get_epsilon(TARGET_DELTA)
-        print(f"  Privacy   : ε = {epsilon:.4f}, δ = {TARGET_DELTA}")
+        from opacus import PrivacyEngine
+        from opacus.utils.batch_memory_manager import BatchMemoryManager
+
+        print("Configuring Opacus Privacy Engine...")
+        privacy_engine = PrivacyEngine()
+
+        if TARGET_SIGMA is not None:
+            model, optimizer, trainloader = privacy_engine.make_private(
+                module=model,
+                optimizer=optimizer,
+                data_loader=trainloader,
+                noise_multiplier=TARGET_SIGMA,
+                max_grad_norm=MAX_GRAD_NORM,
+            )
+            print(f"Using fixed sigma: {TARGET_SIGMA:.4f}")
+        else:
+            model, optimizer, trainloader = privacy_engine.make_private_with_epsilon(
+                module=model,
+                optimizer=optimizer,
+                data_loader=trainloader,
+                epochs=EPOCHS,
+                target_epsilon=TARGET_EPSILON,
+                target_delta=TARGET_DELTA,
+                max_grad_norm=MAX_GRAD_NORM,
+            )
+            print(f"Target epsilon mode: ε = {TARGET_EPSILON:.4f}")
+        print(f"Using noise multiplier: {optimizer.noise_multiplier:.4f}")
     else:
-        print(f"  Privacy   : Disabled")
-    print(f"  LR        : {current_lr:.6f}")
-    print("-" * 60)
+        print("⚠️  Differential Privacy DISABLED — training without privacy guarantees.")
+    print(f"Output directory: {OUTPUT_DIR}")
 
-print(f"\nTraining complete. Best Val Acc: {best_val_acc:.2f}%")
+    # Cosine annealing LR scheduler — attach AFTER private wrapping
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
 
-csv_fields = ["Epochs", "batch size", "sample rate (q)", "steps (T)", "best_val_acc", "sigma"]
-csv_row = {
-    "Epochs": EPOCHS,
-    "batch size": VIRTUAL_BATCH_SIZE,
-    "sample rate (q)": sample_rate_q,
-    "steps (T)": steps_T,
-    "best_val_acc": best_val_acc,
-    "sigma": sigma,
-}
+    # ==========================================
+    # 5. Training Loop
+    # ==========================================
+    best_val_acc = 0.0
+    sample_rate_q = VIRTUAL_BATCH_SIZE / len(trainset)
+    steps_T = int(EPOCHS / sample_rate_q)
+    sigma = float(getattr(optimizer, "noise_multiplier", 0.0)) if USE_DIFFERENTIAL_PRIVACY else 0.0
 
-with open(RESULTS_CSV_PATH, "a", newline="") as f:
-    writer = csv.DictWriter(f, fieldnames=csv_fields)
-    if f.tell() == 0:
-        writer.writeheader()
-    writer.writerow(csv_row)
+    for epoch in range(EPOCHS):
+        model.train()
+        # Using a dictionary to hold mutable state across the inner function scope
+        train_stats = {'loss': 0.0, 'correct': 0, 'total': 0}
 
-print(f"Saved training summary to {RESULTS_CSV_PATH}")
+        def run_train_epoch(data_loader):
+            """Inner training loop, shared by both DP and non-DP paths."""
+            for images, targets in data_loader:
+                images, targets = images.to(DEVICE), targets.to(DEVICE)
+
+                optimizer.zero_grad()
+                outputs = model(images)
+                loss    = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+                train_stats['loss'] += loss.item() * images.size(0)
+                _, predicted = outputs.max(1)
+                train_stats['total']   += targets.size(0)
+                train_stats['correct'] += predicted.eq(targets).sum().item()
+
+        if USE_DIFFERENTIAL_PRIVACY:
+            with BatchMemoryManager(
+                data_loader=trainloader,
+                max_physical_batch_size=MAX_PHYSICAL_BATCH_SIZE,
+                optimizer=optimizer,
+            ) as memory_safe_data_loader:
+                run_train_epoch(memory_safe_data_loader)
+        else:
+            run_train_epoch(trainloader)
+
+        train_acc = 100. * train_stats['correct'] / train_stats['total']
+        scheduler.step()
+
+        # ==========================================
+        # Validation Loop
+        # ==========================================
+        model.eval()
+        test_loss    = 0.0
+        test_correct = 0
+        test_total   = 0
+
+        with torch.no_grad():
+            for images, targets in testloader:
+                images, targets = images.to(DEVICE), targets.to(DEVICE)
+
+                outputs = model(images)
+                loss    = criterion(outputs, targets)
+
+                test_loss    += loss.item() * images.size(0)
+                _, predicted  = outputs.max(1)
+                test_total   += targets.size(0)
+                test_correct += predicted.eq(targets).sum().item()
+
+        test_acc = 100. * test_correct / test_total
+
+        if test_acc > best_val_acc:
+            best_val_acc = test_acc
+            # torch.save(model.state_dict(), BEST_MODEL_PATH)
+            print(f"  ✅ New best model saved ({best_val_acc:.2f}%)")
+
+        current_lr = scheduler.get_last_lr()[0]
+
+        print(f"\nEnd of Epoch {epoch+1}:")
+        print(f"  Train Acc : {train_acc:.2f}%")
+        print(f"  Val Acc   : {test_acc:.2f}%  (Best: {best_val_acc:.2f}%)")
+        if USE_DIFFERENTIAL_PRIVACY:
+            epsilon = privacy_engine.get_epsilon(TARGET_DELTA)
+            print(f"  Privacy   : ε = {epsilon:.4f}, δ = {TARGET_DELTA}")
+        else:
+            print(f"  Privacy   : Disabled")
+        print(f"  LR        : {current_lr:.6f}")
+        print("-" * 60)
+
+    print(f"\nTraining complete. Best Val Acc: {best_val_acc:.2f}%")
+
+    if USE_DIFFERENTIAL_PRIVACY:
+        final_epsilon = privacy_engine.get_epsilon(TARGET_DELTA)
+    else:
+        final_epsilon = None
+
+    csv_fields = [
+        "Epochs",
+        "batch size",
+        "sample rate (q)",
+        "steps (T)",
+        "best_val_acc",
+        "privacy_mode",
+        "target_epsilon",
+        "target_sigma",
+        "sigma",
+        "final_epsilon",
+    ]
+    csv_row = {
+        "Epochs": EPOCHS,
+        "batch size": VIRTUAL_BATCH_SIZE,
+        "sample rate (q)": sample_rate_q,
+        "steps (T)": steps_T,
+        "best_val_acc": best_val_acc,
+        "privacy_mode": "sigma" if (USE_DIFFERENTIAL_PRIVACY and TARGET_SIGMA is not None) else ("epsilon" if USE_DIFFERENTIAL_PRIVACY else "disabled"),
+        "target_epsilon": TARGET_EPSILON if USE_DIFFERENTIAL_PRIVACY else None,
+        "target_sigma": TARGET_SIGMA if USE_DIFFERENTIAL_PRIVACY else None,
+        "sigma": sigma,
+        "final_epsilon": final_epsilon,
+    }
+
+    # with open(RESULTS_CSV_PATH, "a", newline="") as f:
+    #     writer = csv.DictWriter(f, fieldnames=csv_fields)
+    #     if f.tell() == 0:
+    #         writer.writeheader()
+    #     writer.writerow(csv_row)
+
+    # print(f"Saved training summary to {RESULTS_CSV_PATH}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train ConvNeXt on Tiny ImageNet with optional Differential Privacy.")
+    privacy_group = parser.add_mutually_exclusive_group()
+    privacy_group.add_argument(
+        "--target-epsilon",
+        "--epsilon",
+        type=float,
+        default=None,
+        help="Target privacy epsilon used when differential privacy is enabled.",
+    )
+    privacy_group.add_argument(
+        "--sigma",
+        type=float,
+        default=None,
+        help="Noise multiplier (sigma) used when differential privacy is enabled.",
+    )
+    parser.add_argument(
+        "--use-differential-privacy",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_USE_DIFFERENTIAL_PRIVACY,
+        help="Enable/disable differential privacy (use --no-use-differential-privacy to disable).",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=DEFAULT_LEARNING_RATE,
+        help="Initial learning rate for Adam optimizer.",
+    )
+    args = parser.parse_args()
+
+    start_training(args)

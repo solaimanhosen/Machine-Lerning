@@ -21,26 +21,8 @@ echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "Working directory: $(pwd)"
 
 # RUN PROGRAM
-PRIVACY_MODE="sigma"   # "epsilon" or "sigma"
-# EPSILON=2.0
-SIGMA=0.7142510986
-LEARNING_RATE=0.0005
-if [ "${PRIVACY_MODE}" = "sigma" ]; then
-  PRIVACY_ARGS=(--sigma "${SIGMA}")
-  PRIVACY_TAG="sigma${SIGMA}"
-elif [ "${PRIVACY_MODE}" = "epsilon" ]; then
-  PRIVACY_ARGS=(--epsilon "${EPSILON}")
-  PRIVACY_TAG="eps${EPSILON}"
-else
-  echo "Invalid PRIVACY_MODE='${PRIVACY_MODE}'. Use 'epsilon' or 'sigma'."
-  exit 1
-fi
-
-LOG_FILE="logs/direct_convnext_tiny_run_private_${PRIVACY_TAG}_lr${LEARNING_RATE}.log"
-python convnext_tiny.py \
-  --use-differential-privacy \
-  "${PRIVACY_ARGS[@]}" \
-  --learning-rate "${LEARNING_RATE}" \
-  > "${LOG_FILE}" 2>&1
+# python run_direct_sigma.py > logs/std_convnext_tiny_run_direct_sigma.log 2>&1
+# python run_fdp_sigma.py > logs/std_convnext_tiny_run_fdp_sigma.log 2>&1
+python run_std_sigma.py > logs/std_convnext_tiny_run_std_sigma.log 2>&1
 
 echo "Job completed successfully"
